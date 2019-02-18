@@ -1,0 +1,6 @@
+*.pyc
+*.xml
+.idea/
+__pychache__/
+storage/__pychache__/
+spi/__pycache__/
