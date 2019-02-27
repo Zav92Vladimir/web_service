@@ -1,33 +1,27 @@
-from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
-import psycopg2
+import asyncpg
 import redis
 import json
-import time
 
 
 class Storage:
 
-    def __init__(self):
-        self.executor = ThreadPoolExecutor(max_workers=2)
+    async def init_connections(self):
         self.init_redis()
-        self.init_psql()
+        await self.init_psql()
 
     def init_redis(self):
-        time.sleep(5)  # need to wait until db starts inside a container
         self.redis_conn = redis.Redis("redis", 6379)
 
-    def init_psql(self):
-        time.sleep(5)  # need to wait until db starts inside a container
-        self.psql_conn = psycopg2.connect(dbname='tasks', user='test_user', host='psgrsql')
-        self.cursor = self.psql_conn.cursor()
-        self.create_tables()
+    async def init_psql(self):
+
+        self.pool = await asyncpg.create_pool(database='tasks', user='test_user', host='psgrsql')
+        await self.create_tables()
 
     async def closing(self, app):
-        self.cursor.close()
-        self.psql_conn.close()
+        await self.pool.close()
 
-    def create_tables(self):
+    async def create_tables(self):
 
         queries = (
             """
@@ -39,24 +33,15 @@ class Storage:
                     time_to_execute INTEGER
             )
             """,
-            """
-            CREATE TABLE IF NOT EXISTS completed_tasks (
-                    id INTEGER PRIMARY KEY,
-                    create_time TIMESTAMP,
-                    start_time TIMESTAMP,
-                    exec_time INTEGER
-            )
-            """
         )
 
-        for query in queries:
-            self.cursor.execute(query)
+        async with self.pool.acquire() as psql_conn:
+            for query in queries:
+                await psql_conn.execute(query)
 
-        self.psql_conn.commit()
-
-    def launch_queue(self, execute, callback):
+    def launch_queue(self):
         for _ in range(self.redis_conn.llen("queue")):
-            self.executor.submit(execute).add_done_callback(callback)
+            yield _
 
     def push_task_id(self, value):
         self.redis_conn.rpush("queue", value)
@@ -71,25 +56,23 @@ class Storage:
     def caching(self, key, value):
         self.redis_conn.setex(key, 60*60*24, json.dumps(value))
 
-    def psql_insert(self, table, fields, values, return_required=False):
-        value_placeholders = ", ".join(["%s" for _ in values])
-        _fields = ", ".join([it for it in fields])
-        return_ = "RETURNING id" if return_required else ""
-        sql_string = "INSERT INTO {0} ({1}) VALUES ({2}) {3}".format(table, _fields, value_placeholders, return_)
-        self.cursor.execute(sql_string, tuple(values))
-        self.psql_conn.commit()
-        return self.cursor.fetchone()[0] if return_required else None
+    async def psql_insert(self, fields, values, return_required=False):
+        async with self.pool.acquire() as psql_conn:
+            value_placeholders = ", ".join(["${0}".format(it) for it in range(1, len(values) + 1)])
+            _fields = ", ".join([it for it in fields])
+            return_ = "RETURNING id" if return_required else ""
+            sql_string = "INSERT INTO task_tracking ({0}) VALUES ({1}) {2}".format(_fields, value_placeholders, return_)
+            return (await psql_conn.fetchrow(sql_string, *tuple(values)))[0] if return_required else None
 
-    def psql_select(self, searching_param):
-        self.cursor.execute("SELECT * FROM task_tracking WHERE id = %s", (searching_param,))
-        self.psql_conn.commit()
-        result = self.cursor.fetchone()
-        if result:
-            result = [it.strftime("%Y-%m-%d %H:%M:%S") if isinstance(it, datetime) else it for it in result]
-        return result
+    async def psql_select(self, searching_param):
+        async with self.pool.acquire() as psql_conn:
+            result = await psql_conn.fetchrow("SELECT * FROM task_tracking WHERE id = $1", *(searching_param,))
+            if result:
+                result = [it.strftime("%Y-%m-%d %H:%M:%S") if isinstance(it, datetime) else it for it in result]
+            return result
 
-    def psql_update(self, fields, values, searching_param):
-        set_query = ", ".join(["{0} = '{1}'".format(f, v) for f, v in zip(fields, values)])
-        sql_string = "UPDATE task_tracking SET {0} WHERE id = {1}".format(set_query, "%s")
-        self.cursor.execute(sql_string, (searching_param, ))
-        self.psql_conn.commit()
+    async def psql_update(self, fields, values, searching_param):
+        async with self.pool.acquire() as psql_conn:
+            set_query = ", ".join(["{0} = '{1}'".format(f, v) for f, v in zip(fields, values)])
+            sql_string = "UPDATE task_tracking SET {0} WHERE id = {1}".format(set_query, "$1")
+            await psql_conn.execute(sql_string, *(searching_param, ))
